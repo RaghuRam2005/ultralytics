@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from torch.nn.modules.batchnorm import _BatchNorm
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -194,6 +195,9 @@ class BaseTrainer:
             # Start console logging immediately at trainer initialization
             self.run_callbacks("on_pretrain_routine_start")
 
+        # helper attribute for bn weights
+        self.bn_weights = None
+
     def add_callback(self, event: str, callback):
         """Append the given callback to the event's callback list."""
         self.callbacks[event].append(callback)
@@ -266,6 +270,8 @@ class BaseTrainer:
 
         # Compile model
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
+
+        self.bn_weights = [m.weight for m in unwrap_model(self.model).modules() if isinstance(m, _BatchNorm)]
 
         # Freeze layers
         freeze_list = (
@@ -419,6 +425,12 @@ class BaseTrainer:
                     preds = self.model(batch["img"])
                     loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
                     self.loss = loss.sum()
+
+                    if getattr(self.args, "l1_lambda", 0.0) > 0:
+                        with torch.cuda.amp.autocast(enabled=False):
+                            l1 = torch.stack([w.float().abs().sum() for w in self.bn_weights if w.requires_grad]).sum()
+                        self.loss += self.args.l1_lambda * l1
+                    
                     if RANK != -1:
                         self.loss *= self.world_size
                     self.tloss = (
