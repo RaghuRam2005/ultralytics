@@ -185,6 +185,7 @@ CFG_FRACTION_KEYS = frozenset(
         "conf",
         "iou",
         "fraction",
+        "l1_lambda",
     }
 )
 CFG_INT_KEYS = frozenset(
