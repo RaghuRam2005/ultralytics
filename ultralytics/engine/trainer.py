@@ -272,6 +272,9 @@ class BaseTrainer:
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
 
         self.bn_weights = [m.weight for m in unwrap_model(self.model).modules() if isinstance(m, _BatchNorm)]
+        thresh = len(self.bn_weights)
+        check_fused = self.model.is_fused(thresh=thresh)
+        LOGGER.info(f"Fused Check:{check_fused}")
 
         # Freeze layers
         freeze_list = (
@@ -400,6 +403,9 @@ class BaseTrainer:
                 self.train_loader.reset()
 
             if RANK in {-1, 0}:
+                if getattr(self, "_l1_log", None):
+                    l1_coeff, l1_val = self._l1_log
+                    LOGGER.info(f"L1 coeff={l1_coeff:.2e}, L1 term={l1_val:.2f}")
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
@@ -427,9 +433,12 @@ class BaseTrainer:
                     self.loss = loss.sum()
 
                     if getattr(self.args, "l1_lambda", 0.0) > 0:
+                        l1_coeff = one_cycle(0.0, self.args.l1_lambda, steps=self.epochs)(self.epoch)
                         with torch.cuda.amp.autocast(enabled=False):
                             l1 = torch.stack([w.float().abs().sum() for w in self.bn_weights if w.requires_grad]).sum()
-                        self.loss += self.args.l1_lambda * l1
+                        self.loss += l1_coeff * l1
+                        if i == 0:  # log once at the first batch of each epoch
+                            self._l1_log = (l1_coeff, float(l1.detach()))
                     
                     if RANK != -1:
                         self.loss *= self.world_size
@@ -459,7 +468,7 @@ class BaseTrainer:
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
                     pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                         ("%11s" * 2 + "%11.4g" * (2 + loss_length))
                         % (
                             f"{epoch + 1}/{self.epochs}",
                             f"{self._get_memory():.3g}G",  # (GB) GPU memory util
